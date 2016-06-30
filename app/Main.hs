@@ -45,9 +45,12 @@ main = do
 
   m <- startProcess conf
 
-  enqueue m count 10
-  enqueue m count 7
-  enqueue m count 19
-  enqueue m crash ()
-
-  await m
+  let loop = do
+        enqueue m count 10
+        enqueue m count 7
+        enqueue m count 19
+        enqueue m crash ()
+        t <- getLine
+        unless (t == "q") loop
+  loop
+  -- await m

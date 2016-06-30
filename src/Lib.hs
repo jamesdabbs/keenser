@@ -21,6 +21,7 @@ import           Control.Concurrent.STM.TVar
 import           Control.Concurrent.Lifted   (fork, forkFinally, myThreadId, threadDelay)
 import           Control.Concurrent.STM      (atomically)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
+import           Control.Exception.Lifted    (SomeException, catch)
 import           Control.Monad               (forever, liftM, replicateM_, void)
 import           Control.Monad.Logger
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
@@ -77,6 +78,8 @@ data Manager = Manager
 
   , managerRedis       :: Connection
   , managerRunning     :: TVar (S.Set ThreadId)
+  , managerComplete    :: TVar Integer
+  , managerFailed      :: TVar Integer
   }
 
 data Job a = Job
@@ -97,7 +100,6 @@ instance ToJSON Manager where
     , "queues"      .= managerQueues
     -- TODO: labels ~ []
     , "identity"    .= managerIdentity
-
     ]
 
 instance ToJSON WorkerName where
@@ -165,65 +167,109 @@ randomHex n = do
   where
     digits = ['0' .. '9'] ++ ['A' .. 'F']
 
+-- TODO:
+-- - handle the various failure modes here (timeout, can't match worker, can't get work)
+-- - if doWork crashes, we should requeue the job, kill this thread, and restart a new processor
 startProcessor :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
                => Connection
-               -> [Queue]
+               -> Manager
                -> (BS.ByteString -> Maybe (Worker m BS.ByteString))
                -> m ()
-startProcessor conn qs dispatcher = forever $ do
-  -- TODO: update busy and stats on start / done
-  ejob <- liftIO . runRedis conn $ brpop qs 30 -- FIXME: timeout
+startProcessor conn m dispatcher = forever $ do
+  ejob <- liftIO . runRedis conn $ brpop (managerQueues m) 30 -- FIXME: timeout
   case ejob of
     Right (Just (_, jjob)) -> case dispatcher jjob of
       Nothing     -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
-      Just worker -> workerPerform worker jjob
+      Just worker -> doWork m worker jjob
     _ -> $(logError) "could not get work" -- FIXME
 
+doWork :: (MonadBaseControl IO m, MonadIO m) => Manager -> Worker m a -> a -> m ()
+doWork Manager{..} worker args = do
+  tid <- myThreadId
+  let
+    run = do
+      workerPerform worker args
+      liftIO . atomically $ do
+        modifyTVar' managerRunning $ S.delete tid
+        modifyTVar' managerComplete (+1)
+
+    recordError :: MonadIO m => SomeException -> m ()
+    recordError e = liftIO . atomically $ do
+      modifyTVar' managerRunning $ S.delete tid
+      modifyTVar' managerFailed (+1)
+  liftIO . atomically . modifyTVar' managerRunning $ S.insert tid
+  run `catch` recordError
+
+
 startProcess :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Config m -> m Manager
-startProcess Config{..} = do
-  now      <- liftIO getCurrentTime
-  host     <- liftIO getHostName
-  CPid pid <- liftIO getProcessID
-  nonce    <- liftIO $ randomHex 6
-  busy     <- liftIO $ newTVarIO S.empty
+startProcess c@Config{..} = do
+  m <- mkManager c
+  startBeat m
+
+  -- Start up concurrency many processor threads
+  replicateM_ kConcurrency . forkMonitored m . startProcessor kRedis m $ findWorker kWorkers
+  return m
+
+mkManager :: MonadIO m => Config m -> m Manager
+mkManager Config{..} = liftIO $ do
+  now      <- getCurrentTime
+  host     <- getHostName
+  CPid pid <- getProcessID
+  nonce    <- randomHex 6
+  busy     <- newTVarIO S.empty
+  complete <- newTVarIO 0
+  failed   <- newTVarIO 0
 
   let key = BSC.pack $ concat [host, ".", show pid, ".", BSC.unpack nonce]
 
-  let m = Manager
-        { managerHostname    = BSC.pack host
-        , managerStartedAt   = now
-        , managerPid         = pid
-        , managerConcurrency = kConcurrency
-        , managerQueues      = kQueues
-        , managerLabels      = [] -- TODO
-        , managerIdentity    = key
+  return Manager
+    { managerHostname    = BSC.pack host
+    , managerStartedAt   = now
+    , managerPid         = pid
+    , managerConcurrency = kConcurrency
+    , managerQueues      = kQueues
+    , managerLabels      = [] -- TODO
+    , managerIdentity    = key
+    , managerRedis       = kRedis
+    , managerRunning     = busy
+    , managerComplete    = complete
+    , managerFailed      = failed
+    }
 
-        , managerRedis       = kRedis
-        , managerRunning     = busy
-        }
+startBeat :: MonadIO m => Manager -> m ThreadId
+startBeat m@Manager{..} = liftIO . forkFinally (heartBeat m) $ \_ -> do
+  void . runRedis managerRedis $ do
+    srem "processess" [managerIdentity]
+    del [managerIdentity]
 
-  -- Heartbeat check
-  fork . liftIO . forever $ do
-    now   <- getCurrentTime
-    count <- readTVarIO busy
-    runRedis kRedis $ do
-      sadd "processes" [key]
-      hmset key
-        [ ("beat",  timestamp now)
-        , ("info",  LBS.toStrict $ encode m)
-        , ("busy",  BSC.pack . show $ count)
-        , ("quiet", "false") -- TODO should be true iff the worker has stopped taking jobs
-        ]
-      expire key 60
-    threadDelay $ 5 * 1000000
+heartBeat :: Manager -> IO ()
+heartBeat m@Manager{..} = forever $ do
+  now   <- getCurrentTime
+  count <- S.size <$> readTVarIO managerRunning
+  dones <- atomically $ swapTVar managerComplete 0
+  fails <- atomically $ swapTVar managerFailed   0
 
-  -- Start up concurrency many processor threads
-  replicateM_ kConcurrency . forkMonitored m . startProcessor kRedis kQueues $ findWorker kWorkers
-
-  return m
+  -- For what it's worth, an abort between here and the end of the block could cause us to under-report stats
+  runRedis managerRedis $ do
+    sadd "processes" [managerIdentity]
+    hmset managerIdentity
+      [ ("beat",  timestamp now)
+      , ("info",  LBS.toStrict $ encode m)
+      , ("busy",  BSC.pack . show $ count)
+      , ("quiet", "false") -- TODO should be true iff the worker has stopped taking jobs
+      ]
+    incrby "stats:complete" dones
+    incrby ("stats:complete:" <> day now) dones
+    incrby "stats:failed" fails
+    incrby ("stats:failed:" <> day now) dones
+    expire managerIdentity 60
+  sleep 5
 
 timestamp :: UTCTime -> BS.ByteString
 timestamp = BSC.pack . formatTime defaultTimeLocale "%s%Q"
+
+day :: UTCTime -> BS.ByteString
+day = BSC.pack . formatTime defaultTimeLocale "%Y-%m-%d"
 
 findWorker :: M.Map WorkerName (Worker m a) -> BS.ByteString -> Maybe (Worker m a)
 findWorker workers payload = case workerClass payload of
