@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE FlexibleInstances    #-}
+{-# LANGUAGE LambdaCase           #-}
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE RecordWildCards      #-}
 {-# LANGUAGE TemplateHaskell      #-}
@@ -9,6 +10,7 @@ module Lib
   , Worker(..)
   , await
   , concurrency
+  , halt
   , enqueue
   , mkConf
   , register
@@ -18,29 +20,33 @@ module Lib
 
 import           Control.Concurrent          (ThreadId)
 import           Control.Concurrent.STM.TVar
-import           Control.Concurrent.Lifted   (fork, forkFinally, myThreadId, threadDelay)
+import           Control.Concurrent.Lifted   (fork, forkFinally, killThread, myThreadId, threadDelay)
 import           Control.Concurrent.STM      (atomically)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
 import           Control.Exception.Lifted    (SomeException, catch)
-import           Control.Monad               (forever, liftM, replicateM_, void)
+import           Control.Monad               (forever, forM_, liftM, replicateM_, void)
+import           Control.Monad.Base          (MonadBase)
 import           Control.Monad.Logger
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
 import           Control.Monad.Trans.Control (MonadBaseControl)
 import           Control.Monad.Trans.Reader  (ReaderT, ask, runReaderT)
 import           Control.Monad.Trans.State
 import           Data.Aeson
+import           Data.Attoparsec             (parseOnly)
 import qualified Data.ByteString             as BS
 import qualified Data.ByteString.Char8       as BSC
 import qualified Data.ByteString.Lazy        as LBS
 import           Data.Int                    (Int32)
 import           Data.List                   as L
 import qualified Data.Map                    as M
+import           Data.Maybe                  (fromMaybe)
 import           Data.Monoid                 ((<>))
 import qualified Data.Set                    as S
+import qualified Data.Scientific             as SC
 import qualified Data.Text                   as T
 import           Data.Text.Encoding          (decodeUtf8, encodeUtf8)
 import           Data.Time.Clock             (UTCTime, getCurrentTime)
-import           Data.Time.Format            (defaultTimeLocale, formatTime)
+import           Data.Time.Format            (defaultTimeLocale, formatTime, parseTimeOrError)
 import           Database.Redis              hiding (decode)
 import           Network.HostName            (getHostName)
 import           System.Posix.Process        (getProcessID)
@@ -49,6 +55,8 @@ import           System.Posix.Types          (CPid(..))
 import           Data.Random
 import           Data.Random.Source.DevRandom
 import           Data.Random.Extras
+
+import Debug.Trace
 
 type JobId      = BS.ByteString
 type Queue      = BS.ByteString
@@ -61,7 +69,7 @@ data Worker m a = Worker
   }
 
 data Config m = Config
-  { kWorkers     :: M.Map WorkerName (Worker m BS.ByteString)
+  { kWorkers     :: M.Map WorkerName (Worker m Value)
   , kQueues      :: [Queue]
   , kConcurrency :: Int
   , kRedis       :: Connection
@@ -77,7 +85,7 @@ data Manager = Manager
   , managerIdentity    :: BS.ByteString
 
   , managerRedis       :: Connection
-  , managerRunning     :: TVar (S.Set ThreadId)
+  , managerRunning     :: TVar (M.Map ThreadId RunningJob)
   , managerComplete    :: TVar Integer
   , managerFailed      :: TVar Integer
   }
@@ -90,10 +98,20 @@ data Job a = Job
   , jobEnqueuedAt :: UTCTime
   }
 
+instance Functor Job where
+  fmap f (Job klass args _id retry at) = Job klass (f args) _id retry at
+
+data RunningJob = RunningJob
+  { rjPayload :: Job Value
+  , rjQueue   :: Queue
+  , rjRunAt   :: UTCTime
+  , rjThread  :: ThreadId
+  }
+
 instance ToJSON Manager where
   toJSON Manager{..} = object
     [ "hostname"    .= managerHostname
-    , "started_at"  .= timestamp managerStartedAt
+    , "started_at"  .= (number $ timestamp managerStartedAt)
     , "pid"         .= managerPid
     -- TODO: tag ~ "app"
     , "concurrency" .= managerConcurrency
@@ -114,8 +132,21 @@ instance ToJSON a => ToJSON (Job a) where
     , "args"        .= jobArgs
     , "jid"         .= jobId
     , "retry"       .= jobRetry
-    , "enqueued_at" .= jobEnqueuedAt
+    , "enqueued_at" .= (number $ timestamp jobEnqueuedAt)
     ]
+
+instance ToJSON RunningJob where
+  toJSON RunningJob{..} = object
+    [ "queue"   .= rjQueue
+    , "payload" .= fmap (: []) rjPayload
+    , "run_at"  .= (number $ timestamp rjRunAt)
+    ]
+
+number :: BS.ByteString -> SC.Scientific
+number = read . BSC.unpack
+
+showTime :: SC.Scientific -> UTCTime
+showTime n = parseTimeOrError True defaultTimeLocale "%s%Q" $ SC.formatScientific SC.Fixed (Just 6) n
 
 instance FromJSON a => FromJSON (Job a) where
   parseJSON = withObject "job" $ \v -> do
@@ -123,7 +154,7 @@ instance FromJSON a => FromJSON (Job a) where
     jobArgs       <- v .: "args"
     jobId         <- v .: "jid"
     jobRetry      <- v .: "retry"
-    jobEnqueuedAt <- v .: "enqueued_at"
+    jobEnqueuedAt <- showTime <$> v .: "enqueued_at"
     return Job{..}
 
 type Configurator m = StateT (Config m) m ()
@@ -131,7 +162,7 @@ type Configurator m = StateT (Config m) m ()
 mkConf :: Monad m => Connection -> Configurator m -> m (Config m)
 mkConf conn conf = execStateT conf Config
   { kWorkers     = M.empty
-  , kQueues      = ["queue:default"]
+  , kQueues      = ["default"]
   , kConcurrency = 25
   , kRedis       = conn
   }
@@ -142,13 +173,13 @@ concurrency n = modify $ \c -> c { kConcurrency = n }
 -- TODO:
 -- - verify that worker names are unique
 -- - update queue list (or at least warn if there are queues that aren't being covered)
-register :: (Monad m, FromJSON a) => Worker m a -> Configurator m
+register :: (MonadLogger m, MonadIO m, FromJSON a) => Worker m a -> Configurator m
 register Worker{..} = modify $ \c -> c { kWorkers = M.insert workerName w $ kWorkers c }
   where
-    w = Worker workerName workerQueue $ \s ->
-      case eitherDecode $ LBS.fromStrict s of
-        Right job -> workerPerform $ jobArgs job
-        Left  err  -> error $ "job failed to parse: " ++ show s ++ " / " ++ err
+    w = Worker workerName workerQueue $ \value ->
+      case fromJSON value of
+        Data.Aeson.Success job -> workerPerform job
+        Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show value) <> " / " <> T.pack err
 
 enqueue :: ToJSON a => Manager -> Worker m a -> a -> IO ()
 enqueue Manager{..} Worker{..} args = do
@@ -173,32 +204,51 @@ randomHex n = do
 startProcessor :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
                => Connection
                -> Manager
-               -> (BS.ByteString -> Maybe (Worker m BS.ByteString))
+               -> M.Map WorkerName (Worker m Value)
                -> m ()
-startProcessor conn m dispatcher = forever $ do
-  ejob <- liftIO . runRedis conn $ brpop (managerQueues m) 30 -- FIXME: timeout
+startProcessor conn m workers = forever $ do
+  let mqs = map (\q -> "queue:" <> q) $ managerQueues m
+  ejob <- liftIO . runRedis conn $ brpop mqs 30
   case ejob of
-    Right (Just (_, jjob)) -> case dispatcher jjob of
-      Nothing     -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
-      Just worker -> doWork m worker jjob
-    _ -> $(logError) "could not get work" -- FIXME
+    Right (Just (q, jjob)) -> case dispatch workers jjob of
+      Nothing -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
+      Just (worker, job) -> doWork m worker q job
+    _ -> $(logDebug) "Nothing to do here"
 
-doWork :: (MonadBaseControl IO m, MonadIO m) => Manager -> Worker m a -> a -> m ()
-doWork Manager{..} worker args = do
-  tid <- myThreadId
+dispatch :: M.Map WorkerName (Worker m Value) -> BS.ByteString -> Maybe (Worker m Value, Job Value)
+dispatch workers payload = do
+  jv     <- decode $ LBS.fromStrict payload
+  worker <- M.lookup (jobClass jv) workers
+  return (worker, jv)
+
+rightToMaybe :: Either a b -> Maybe b
+rightToMaybe (Right b) = Just b
+rightToMaybe _ = Nothing
+
+doWork :: (MonadBaseControl IO m, MonadIO m, ToJSON a) => Manager -> Worker m a -> Queue -> Job a -> m ()
+doWork Manager{..} worker q job = do
+  tid <- liftIO myThreadId
+  now <- liftIO getCurrentTime
   let
+    -- m = show tid ++ ": " ++ show (encode job)
     run = do
-      workerPerform worker args
+      -- traceM $ "starting " ++ m
+      workerPerform worker $ jobArgs job
       liftIO . atomically $ do
-        modifyTVar' managerRunning $ S.delete tid
+        -- traceM $ "done & clearing " ++ m
+        modifyTVar' managerRunning $ M.delete tid
         modifyTVar' managerComplete (+1)
 
     recordError :: MonadIO m => SomeException -> m ()
-    recordError e = liftIO . atomically $ do
-      modifyTVar' managerRunning $ S.delete tid
-      modifyTVar' managerFailed (+1)
-  liftIO . atomically . modifyTVar' managerRunning $ S.insert tid
-  run `catch` recordError
+    recordError e = do
+      liftIO . atomically $ do
+        -- traceM $ "failed & clearing " ++ m
+        modifyTVar' managerRunning $ M.delete tid
+        modifyTVar' managerFailed (+1)
+
+    work = RunningJob (toJSON <$> job) q now tid
+  liftIO . atomically . modifyTVar' managerRunning $ M.insert tid work
+  catch run recordError
 
 
 startProcess :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) => Config m -> m Manager
@@ -207,7 +257,7 @@ startProcess c@Config{..} = do
   startBeat m
 
   -- Start up concurrency many processor threads
-  replicateM_ kConcurrency . forkMonitored m . startProcessor kRedis m $ findWorker kWorkers
+  replicateM_ kConcurrency . forkMonitored m $ startProcessor kRedis m kWorkers
   return m
 
 mkManager :: MonadIO m => Config m -> m Manager
@@ -216,7 +266,7 @@ mkManager Config{..} = liftIO $ do
   host     <- getHostName
   CPid pid <- getProcessID
   nonce    <- randomHex 6
-  busy     <- newTVarIO S.empty
+  busy     <- newTVarIO M.empty
   complete <- newTVarIO 0
   failed   <- newTVarIO 0
 
@@ -236,34 +286,54 @@ mkManager Config{..} = liftIO $ do
     , managerFailed      = failed
     }
 
-startBeat :: MonadIO m => Manager -> m ThreadId
-startBeat m@Manager{..} = liftIO . forkFinally (heartBeat m) $ \_ -> do
-  void . runRedis managerRedis $ do
+startBeat :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ThreadId
+startBeat m@Manager{..} = forkFinally (heartBeat m) $ \e -> do
+  case e of
+    Left err -> $(logError) $ "Heartbeat error " <> T.pack (show e)
+    _ -> return ()
+  liftIO . void . runRedis managerRedis $ do
     srem "processess" [managerIdentity]
     del [managerIdentity]
 
-heartBeat :: Manager -> IO ()
-heartBeat m@Manager{..} = forever $ do
-  now   <- getCurrentTime
-  count <- S.size <$> readTVarIO managerRunning
-  dones <- atomically $ swapTVar managerComplete 0
-  fails <- atomically $ swapTVar managerFailed   0
+workload :: MonadIO m => Manager -> m [RunningJob]
+workload Manager{..} = liftIO $ M.elems <$> readTVarIO managerRunning
 
-  -- For what it's worth, an abort between here and the end of the block could cause us to under-report stats
+workToRedis :: RunningJob -> (BS.ByteString, BS.ByteString)
+workToRedis j = (BSC.pack . trim "ThreadId " . show $ rjThread j, LBS.toStrict $ encode j)
+
+trim :: Eq a => [a] -> [a] -> [a]
+trim pre corp = fromMaybe corp $ stripPrefix pre corp
+
+heartBeat :: MonadIO m => Manager -> m ()
+heartBeat m@Manager{..} = liftIO $ do
   runRedis managerRedis $ do
-    sadd "processes" [managerIdentity]
-    hmset managerIdentity
-      [ ("beat",  timestamp now)
-      , ("info",  LBS.toStrict $ encode m)
-      , ("busy",  BSC.pack . show $ count)
-      , ("quiet", "false") -- TODO should be true iff the worker has stopped taking jobs
-      ]
-    incrby "stats:complete" dones
-    incrby ("stats:complete:" <> day now) dones
-    incrby "stats:failed" fails
-    incrby ("stats:failed:" <> day now) dones
-    expire managerIdentity 60
-  sleep 5
+    _ <- del ["queues"]
+    sadd "queues" managerQueues
+
+  forever $ do
+    now     <- getCurrentTime
+    working <- workload m
+    dones   <- atomically $ swapTVar managerComplete 0
+    fails   <- atomically $ swapTVar managerFailed   0
+
+    -- For what it's worth, an abort between here and the end of the block could cause us to under-report stats
+    runRedis managerRedis $ do
+      sadd "processes" [managerIdentity]
+      hmset managerIdentity
+        [ ("beat",  timestamp now)
+        , ("info",  LBS.toStrict $ encode m)
+        , ("busy",  BSC.pack . show $ length working)
+        , ("quiet", "false") -- TODO should be true iff the worker has stopped taking jobs
+        ]
+      _ <- del [managerIdentity <> ":workers"]
+      hmset (managerIdentity <> ":workers") $ map workToRedis working
+      -- traceM $ "dones " ++ show dones
+      incrby "stat:complete" dones
+      incrby ("stat:complete:" <> day now) dones
+      incrby "stat:failed" fails
+      incrby ("stat:failed:" <> day now) dones
+      expire managerIdentity 60
+    sleep 5
 
 timestamp :: UTCTime -> BS.ByteString
 timestamp = BSC.pack . formatTime defaultTimeLocale "%s%Q"
@@ -305,3 +375,8 @@ await _ = do
 
 sleep :: Int -> IO ()
 sleep n = threadDelay $ n * 1000000
+
+halt :: (MonadBase IO m, MonadIO m) => Manager -> m ()
+halt Manager{..} = do
+  running <- liftIO $ readTVarIO managerRunning
+  mapM_ killThread $ M.keys running
