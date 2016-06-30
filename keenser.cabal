@@ -17,6 +17,24 @@ library
   hs-source-dirs:      src
   exposed-modules:     Lib
   build-depends:       base >= 4.7 && < 5
+                     , aeson
+                     , bytestring
+                     , containers
+                     , hedis
+                     , hostname
+                     , lifted-base
+                     , monad-control
+                     , monad-logger
+                     , monad-logger-prefix
+                     -- TODO: this should be Crytpo.Random or something
+                     , random-extras
+                     , random-fu
+                     , random-source
+                     , stm
+                     , text
+                     , time
+                     , transformers
+                     , unix
   default-language:    Haskell2010
 
 executable keenser-exe
@@ -25,6 +43,11 @@ executable keenser-exe
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base
                      , keenser
+                     , bytestring
+                     , fast-logger
+                     , hedis
+                     , monad-logger
+                     , text
   default-language:    Haskell2010
 
 test-suite keenser-test
