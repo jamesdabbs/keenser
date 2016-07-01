@@ -7,24 +7,25 @@
 {-# LANGUAGE TypeSynonymInstances #-}
 module Lib
   ( Manager
+  , Middleware
   , Worker(..)
   , await
   , concurrency
   , halt
   , enqueue
   , mkConf
+  , middleware
   , register
   , sleep
   , startProcess
   ) where
 
 import           Control.Concurrent          (ThreadId)
-import           Control.Concurrent.STM.TVar
 import           Control.Concurrent.Lifted   (fork, forkFinally, killThread, myThreadId, threadDelay)
 import           Control.Concurrent.STM      (atomically)
-import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
+import           Control.Concurrent.STM.TVar (TVar, newTVarIO, modifyTVar', swapTVar, readTVarIO)
 import           Control.Exception.Lifted    (SomeException, catch)
-import           Control.Monad               (forever, forM_, liftM, replicateM_, void)
+import           Control.Monad               (forever, foldM_, forM_, liftM, replicateM_, void)
 import           Control.Monad.Base          (MonadBase)
 import           Control.Monad.Logger
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
@@ -68,11 +69,17 @@ data Worker m a = Worker
   , workerPerform :: a -> m ()
   }
 
+(>$<) :: (a -> b) -> Worker m b -> Worker m a
+f >$< (Worker name q perform) = Worker name q (perform . f)
+
 data Config m = Config
   { kWorkers     :: M.Map WorkerName (Worker m Value)
   , kQueues      :: [Queue]
   , kConcurrency :: Int
   , kRedis       :: Connection
+  -- TODO: I don't love that this all operates on JSON Values rather than on
+  --   well-typed arguments
+  , kMiddleware  :: [Middleware m]
   }
 
 data Manager = Manager
@@ -107,6 +114,9 @@ data RunningJob = RunningJob
   , rjRunAt   :: UTCTime
   , rjThread  :: ThreadId
   }
+
+type Middleware m = (Worker m Value -> Job Value -> Queue -> m ())
+                  -> Worker m Value -> Job Value -> Queue -> m ()
 
 instance ToJSON Manager where
   toJSON Manager{..} = object
@@ -165,10 +175,19 @@ mkConf conn conf = execStateT conf Config
   , kQueues      = ["default"]
   , kConcurrency = 25
   , kRedis       = conn
+  , kMiddleware  = []
   }
 
 concurrency :: Monad m => Int -> Configurator m
 concurrency n = modify $ \c -> c { kConcurrency = n }
+
+middleware :: Monad m => [Middleware m] -> Configurator m
+middleware m = modify $ \c -> c { kMiddleware = m }
+
+
+unJSON j = case fromJSON j of
+  Data.Aeson.Success a -> a
+  Data.Aeson.Error str -> error $ "could not unJSON " ++ str
 
 -- TODO:
 -- - verify that worker names are unique
@@ -176,7 +195,7 @@ concurrency n = modify $ \c -> c { kConcurrency = n }
 register :: (MonadLogger m, MonadIO m, FromJSON a) => Worker m a -> Configurator m
 register Worker{..} = modify $ \c -> c { kWorkers = M.insert workerName w $ kWorkers c }
   where
-    w = Worker workerName workerQueue $ \value ->
+    w = Worker workerName workerQueue $ \value -> do
       case fromJSON value of
         Data.Aeson.Success job -> workerPerform job
         Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show value) <> " / " <> T.pack err
@@ -192,28 +211,25 @@ enqueue Manager{..} Worker{..} args = do
     Right _  -> return ()
 
 randomHex :: Int -> IO BS.ByteString
-randomHex n = do
-  ds <- runRVar (choices n digits) DevRandom
-  return $ BSC.pack ds
-  where
-    digits = ['0' .. '9'] ++ ['A' .. 'F']
+randomHex n = BSC.pack <$> runRVar (choices n digits) DevRandom
+  where digits = ['0' .. '9'] ++ ['A' .. 'F']
 
 -- TODO:
 -- - handle the various failure modes here (timeout, can't match worker, can't get work)
 -- - if doWork crashes, we should requeue the job, kill this thread, and restart a new processor
 startProcessor :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
-               => Connection
-               -> Manager
-               -> M.Map WorkerName (Worker m Value)
-               -> m ()
-startProcessor conn m workers = forever $ do
+               => Config m -> Manager -> m ()
+startProcessor Config{..} m = forever $ do
   let mqs = map (\q -> "queue:" <> q) $ managerQueues m
-  ejob <- liftIO . runRedis conn $ brpop mqs 30
+  ejob <- liftIO . runRedis kRedis $ brpop mqs 30
   case ejob of
-    Right (Just (q, jjob)) -> case dispatch workers jjob of
+    Right (Just (q, jjob)) -> case dispatch kWorkers jjob of
       Nothing -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
-      Just (worker, job) -> doWork m worker q job
+      Just (worker, job) -> applyMiddleware kMiddleware (doWork m) worker job q
     _ -> $(logDebug) "Nothing to do here"
+
+applyMiddleware :: [Middleware m] -> Middleware m
+applyMiddleware = L.foldr (.) id
 
 dispatch :: M.Map WorkerName (Worker m Value) -> BS.ByteString -> Maybe (Worker m Value, Job Value)
 dispatch workers payload = do
@@ -225,8 +241,9 @@ rightToMaybe :: Either a b -> Maybe b
 rightToMaybe (Right b) = Just b
 rightToMaybe _ = Nothing
 
-doWork :: (MonadBaseControl IO m, MonadIO m, ToJSON a) => Manager -> Worker m a -> Queue -> Job a -> m ()
-doWork Manager{..} worker q job = do
+doWork :: (MonadBaseControl IO m, MonadIO m, ToJSON a)
+       => Manager -> Worker m a -> Job a -> Queue -> m ()
+doWork Manager{..} worker job q = do
   tid <- liftIO myThreadId
   now <- liftIO getCurrentTime
   let
@@ -257,7 +274,7 @@ startProcess c@Config{..} = do
   startBeat m
 
   -- Start up concurrency many processor threads
-  replicateM_ kConcurrency . forkMonitored m $ startProcessor kRedis m kWorkers
+  replicateM_ kConcurrency . forkMonitored m $ startProcessor c m
   return m
 
 mkManager :: MonadIO m => Config m -> m Manager
@@ -340,25 +357,6 @@ timestamp = BSC.pack . formatTime defaultTimeLocale "%s%Q"
 
 day :: UTCTime -> BS.ByteString
 day = BSC.pack . formatTime defaultTimeLocale "%Y-%m-%d"
-
-findWorker :: M.Map WorkerName (Worker m a) -> BS.ByteString -> Maybe (Worker m a)
-findWorker workers payload = case workerClass payload of
-  Just klass -> M.lookup klass workers
-  Nothing -> Nothing
-
-data Job' = Job' -- TODO: be beter
-  { jobKlass :: WorkerName }
-
-instance FromJSON Job' where
-  parseJSON = withObject "job'" $ \v -> do
-    jobKlass      <- v .: "class"
-    return Job'{..}
-
-workerClass :: BS.ByteString -> Maybe WorkerName
-workerClass s = jobKlass <$> parsed
-  where
-    parsed :: Maybe Job'
-    parsed = decode $ LBS.fromStrict s
 
 forkMonitored :: (MonadBaseControl IO m, MonadIO m) => Manager -> m () -> m ()
 forkMonitored m a = do

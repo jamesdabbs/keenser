@@ -8,6 +8,7 @@ import Lib
 import Control.Concurrent
 import Control.Monad
 import Control.Monad.Logger
+import Data.Aeson
 import qualified Data.ByteString as BS
 import Data.Maybe
 import Data.Monoid
@@ -38,6 +39,15 @@ crash = Worker "crash" "default" $ \_ -> do
   sleep 1
   error "Three, sir"
 
+notify :: T.Text -> Middleware IO
+notify str run w j q = do
+  $(logDebug) $ str <> " - starting job " <> s q <> " " <> (s $ encode j)
+  run w j q
+  $(logDebug) $ str <> " - done"
+
+noop :: Middleware IO
+noop = id
+
 defaults :: [a] -> [a] -> [a]
 defaults (a:as) (b:bs) = b : defaults as bs
 defaults as [] = as
@@ -52,6 +62,7 @@ main = do
 
   conn <- connect defaultConnectInfo
   conf <- mkConf conn $ do
+    middleware [notify "[Middleware] "]
     concurrency par
     register count
     register crash
