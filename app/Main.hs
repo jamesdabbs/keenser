@@ -1,9 +1,8 @@
-{-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TemplateHaskell   #-}
 module Main where
 
-import Lib
+import Keenser
 
 import Control.Concurrent
 import Control.Monad
@@ -40,13 +39,13 @@ crash = Worker "crash" "default" $ \_ -> do
   error "Three, sir"
 
 notify :: T.Text -> Middleware IO
-notify str run w j q = do
+notify str m w j q run = do
   $(logDebug) $ str <> " - starting job " <> s q <> " " <> (s $ encode j)
-  run w j q
+  run
   $(logDebug) $ str <> " - done"
 
 noop :: Middleware IO
-noop = id
+noop m w j q run = run
 
 defaults :: [a] -> [a] -> [a]
 defaults (a:as) (b:bs) = b : defaults as bs
@@ -56,28 +55,33 @@ defaults _ _ = []
 main :: IO ()
 main = do
   args <- getArgs
-  let par:jobs:_ = defaults [5,20] $ map read args
+  let par:counts:crashes:_ = defaults [5,20,0] $ map read args
 
-  putStrLn $ show par ++ " workers, " ++ show jobs ++ " jobs"
+  putStrLn $ show par ++ " workers, " ++ show counts ++ " passes, "  ++ show crashes ++ " fails"
 
   conn <- connect defaultConnectInfo
   conf <- mkConf conn $ do
-    middleware [notify "[Middleware] "]
+    middleware monitor
+    middleware retry
+    -- middleware $ notify "[Middleware 1] "
+    -- middleware $ notify "[Middleware 2] "
     concurrency par
     register count
     register crash
 
   m <- startProcess conf
 
-  loop m jobs
-  -- await m
+  -- enqueueIn 60 m count 3
 
-loop m limit = do
-  putStrLn $ "Q'ing " ++ show limit ++ " jobs"
-  forM_ [1 .. limit] $ enqueue m count
-  t <- getLine
-  if t == "q"
-    then do
-      putStrLn "Stopping"
-      halt m
-    else loop m limit
+  replicateM_ crashes $ enqueue m crash ()
+  forM_ [1 .. counts] $ enqueue m count
+
+  forkIO . forever $ do
+    t <- getLine
+    if t == "q"
+      then do
+        putStrLn "Stopping"
+        halt m
+      else putStrLn "Press `q` to quit"
+
+  await m
