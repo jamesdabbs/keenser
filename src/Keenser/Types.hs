@@ -24,7 +24,7 @@ import qualified Data.Text                   as T
 import           Data.Text.Encoding          (decodeUtf8, encodeUtf8)
 import           Database.Redis              (Connection)
 
-import Keenser.Util
+import Keenser.Import
 
 data Config m = Config
   { kWorkers     :: M.Map WorkerName (Worker m Value)

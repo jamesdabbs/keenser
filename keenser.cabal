@@ -17,8 +17,11 @@ library
   hs-source-dirs:      src
   exposed-modules:     Keenser
                      , Keenser.Middleware
+                     , Keenser.Middleware.Retry
+                     , Keenser.Middleware.Stats
                      , Keenser.Types
                      , Keenser.Util
+  other-modules:       Keenser.Import
   build-depends:       base >= 4.7 && < 5
                      , aeson
                      , attoparsec

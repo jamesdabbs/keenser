@@ -47,12 +47,9 @@ import           Network.HostName            (getHostName)
 import           System.Posix.Process        (getProcessID)
 import           System.Posix.Types          (CPid(..))
 
-import           Data.Random
-import           Data.Random.Source.DevRandom
-import           Data.Random.Extras
-
 import Debug.Trace
 
+import Keenser.Import
 import Keenser.Middleware
 import Keenser.Types
 import Keenser.Util
@@ -82,14 +79,6 @@ register Worker{..} = modify $ \c -> c { kWorkers = M.insert workerName w $ kWor
         Data.Aeson.Success job -> workerPerform job
         Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show object) <> " / " <> T.pack err
 
-queue :: ToJSON a => Job a -> Redis ()
-queue job = void $ lpush ("queue:" <> jobQueue job) [LBS.toStrict $ encode job]
-
-mkJob :: MonadIO m => Worker m a -> a -> m (Job a)
-mkJob Worker{..} args = liftIO $ do
-  _id <- BSC.pack <$> randomHex 12
-  now <- getCurrentTime
-  return $! Job workerName args _id True now workerQueue
 
 enqueue :: (ToJSON a, MonadIO m) => Manager -> Worker m a -> a -> m ()
 enqueue Manager{..} w args = do
@@ -106,10 +95,6 @@ enqueueIn snds m w args = do
   now <- liftIO getCurrentTime
   enqueueAt (snds `secondsFrom` now) m w args
 
-
-randomHex :: Int -> IO String
-randomHex n = runRVar (choices n digits) DevRandom
-  where digits = ['0' .. '9'] ++ ['A' .. 'F']
 
 -- TODO:
 -- - handle the various failure modes here (timeout, can't match worker, can't get work)
@@ -128,27 +113,12 @@ startProcessor Config{..} m = repeatUntil (managerStopping m) $ do
           (workerPerform worker $ jobArgs job)
     _ -> $(logDebug) "Nothing to do here"
 
-asJSON :: ToJSON a => a -> Object
-asJSON a = case toJSON a of
-  Object o -> o
-  _ -> error "FIXME: define Job -> Object mapping directly"
-
-repeatUntil :: Monad m => m Bool -> m () -> m ()
-repeatUntil check act = do
-  done <- check
-  unless done $ do
-    act
-    repeatUntil check act
 
 dispatch :: M.Map WorkerName (Worker m Value) -> BS.ByteString -> Maybe (Worker m Value, Job Value)
 dispatch workers payload = do
   jv     <- decode $ LBS.fromStrict payload
   worker <- M.lookup (jobClass jv) workers
-  return (worker, jv)
-
-rightToMaybe :: Either a b -> Maybe b
-rightToMaybe (Right b) = Just b
-rightToMaybe _ = Nothing
+  return $! (worker, jv)
 
 redisTimeout :: Integer
 redisTimeout = 30
@@ -175,7 +145,7 @@ startProcess c@Config{..} = do
 
   -- Start up concurrency many processor threads
   replicateM_ kConcurrency . forkWatch m "processor" $ startProcessor c m
-  return m
+  return $! m
 
 startPolling :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ()
 startPolling m@Manager{..} = forkWatch m "poller" . forever $ do
@@ -227,9 +197,6 @@ workload Manager{..} = liftIO $ M.elems <$> readTVarIO managerRunning
 
 workToRedis :: RunningJob -> (BS.ByteString, BS.ByteString)
 workToRedis j = (BSC.pack . trim "ThreadId " . show $ rjThread j, LBS.toStrict $ encode j)
-
-trim :: Eq a => [a] -> [a] -> [a]
-trim pre corp = fromMaybe corp $ stripPrefix pre corp
 
 heartBeat :: MonadIO m => Manager -> m ()
 heartBeat m@Manager{..} = liftIO $ do

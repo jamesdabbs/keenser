@@ -1,39 +1,52 @@
-module Keenser.Util
-  ( module Keenser.Util
-  ) where
+module Keenser.Util where
 
-import Control.Monad               as Keenser.Util
-import Control.Monad.IO.Class      as Keenser.Util (MonadIO, liftIO)
-import Control.Monad.Trans.Control as Keenser.Util (MonadBaseControl)
-import Control.Monad.Trans.State   as Keenser.Util (modify)
-import Data.Aeson                  as Keenser.Util (Value, toJSON, fromJSON, parseJSON, encode, decode)
-import Data.Maybe                  as Keenser.Util (fromMaybe)
-import Data.Monoid                 as Keenser.Util ((<>))
-import Data.Thyme.Clock            as Keenser.Util (UTCTime, getCurrentTime)
-
+import           Data.Aeson
 import           Data.AffineSpace            ((.+^))
 import qualified Data.ByteString             as BS
 import qualified Data.ByteString.Char8       as BSC
+import qualified Data.ByteString.Lazy        as LBS
+import qualified Data.List                   as L
 import           Data.Thyme.Clock            (fromSeconds)
 import           Data.Thyme.Format           (formatTime, readTime)
 import qualified Data.Scientific             as SC
+import           Database.Redis              (Redis, lpush)
 import           System.Locale               (defaultTimeLocale)
 
+import           Data.Random
+import           Data.Random.Source.DevRandom
+import           Data.Random.Extras
 
-timestamp :: UTCTime -> BS.ByteString
-timestamp = BSC.pack . formatTime defaultTimeLocale "%s%Q"
+import Keenser.Import
+import Keenser.Types
 
-daystamp :: UTCTime -> BS.ByteString
-daystamp = BSC.pack . formatTime defaultTimeLocale "%Y-%m-%d"
+queue :: ToJSON a => Job a -> Redis ()
+queue job = void $ lpush (jobQueue job) [LBS.toStrict $ encode job]
 
-timeToJson :: UTCTime -> SC.Scientific
-timeToJson = read . BSC.unpack . timestamp
+randomHex :: Int -> IO String
+randomHex n = runRVar (choices n digits) DevRandom
+  where digits = ['0' .. '9'] ++ ['A' .. 'F']
 
-jsonToTime :: SC.Scientific -> UTCTime
-jsonToTime = readTime defaultTimeLocale "%s%Q" . SC.formatScientific SC.Fixed (Just 6)
+mkJob :: MonadIO m => Worker m a -> a -> m (Job a)
+mkJob Worker{..} args = liftIO $ do
+  _id <- BSC.pack <$> randomHex 12
+  now <- getCurrentTime
+  return $! Job workerName args _id True now ("queue:" <> workerQueue)
 
-timeToDouble :: UTCTime -> Double
-timeToDouble = read . formatTime defaultTimeLocale "%s%Q"
+asJSON :: ToJSON a => a -> Object
+asJSON a = case toJSON a of
+  Object o -> o
+  _ -> error "FIXME: define Job -> Object mapping directly"
 
-secondsFrom :: Rational -> UTCTime -> UTCTime
-secondsFrom n time = time .+^ fromSeconds n
+repeatUntil :: Monad m => m Bool -> m () -> m ()
+repeatUntil check act = do
+  done <- check
+  unless done $ do
+    act
+    repeatUntil check act
+
+rightToMaybe :: Either a b -> Maybe b
+rightToMaybe (Right b) = Just b
+rightToMaybe _ = Nothing
+
+trim :: Eq a => [a] -> [a] -> [a]
+trim pre corp = fromMaybe corp $ L.stripPrefix pre corp
