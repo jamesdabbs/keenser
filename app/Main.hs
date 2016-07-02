@@ -38,9 +38,14 @@ crash = Worker "crash" "default" $ \_ -> do
   sleep 1
   error "Three, sir"
 
+nope :: Worker IO Int
+nope = Worker "nope" "default" $ \n -> do
+  $(logError) $ "Noping out " <> s n
+  error $ "NOPE " ++ show n
+
 notify :: T.Text -> Middleware IO
 notify str m w j q run = do
-  $(logDebug) $ str <> " - starting job " <> s q <> " " <> (s $ encode j)
+  $(logDebug) $ str <> " - starting job " <> s q <> " " <> s (encode j)
   run
   $(logDebug) $ str <> " - done"
 
@@ -61,20 +66,22 @@ main = do
 
   conn <- connect defaultConnectInfo
   conf <- mkConf conn $ do
-    middleware monitor
+    middleware record
     middleware retry
     -- middleware $ notify "[Middleware 1] "
     -- middleware $ notify "[Middleware 2] "
     concurrency par
     register count
     register crash
+    register nope
 
   m <- startProcess conf
 
   -- enqueueIn 60 m count 3
+  enqueue m nope 42
 
-  replicateM_ crashes $ enqueue m crash ()
-  forM_ [1 .. counts] $ enqueue m count
+  -- replicateM_ crashes $ enqueue m crash ()
+  -- forM_ [1 .. counts] $ enqueue m count
 
   forkIO . forever $ do
     t <- getLine

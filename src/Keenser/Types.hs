@@ -62,12 +62,12 @@ data Manager = Manager
   , managerQuiet       :: TVar Bool
   }
 
-type Middleware m = Manager -> Worker m Value -> Job Value -> Queue -> m () -> m ()
+type Middleware m = Manager -> Worker m Value -> Object -> Queue -> m () -> m ()
 
 type Queue = BS.ByteString
 
 data RunningJob = RunningJob
-  { rjPayload :: Job Value
+  { rjPayload :: Object
   , rjQueue   :: Queue
   , rjRunAt   :: UTCTime
   , rjThread  :: ThreadId

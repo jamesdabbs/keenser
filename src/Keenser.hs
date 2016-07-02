@@ -13,7 +13,7 @@ module Keenser
   , enqueueIn
   , mkConf
   , middleware
-  , monitor
+  , record
   , register
   , retry
   , sleep
@@ -77,10 +77,10 @@ concurrency n = modify $ \c -> c { kConcurrency = n }
 register :: (MonadLogger m, MonadIO m, FromJSON a) => Worker m a -> Configurator m
 register Worker{..} = modify $ \c -> c { kWorkers = M.insert workerName w $ kWorkers c }
   where
-    w = Worker workerName workerQueue $ \value -> do
-      case fromJSON value of
+    w = Worker workerName workerQueue $ \object ->
+      case fromJSON object of
         Data.Aeson.Success job -> workerPerform job
-        Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show value) <> " / " <> T.pack err
+        Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show object) <> " / " <> T.pack err
 
 queue :: ToJSON a => Job a -> Redis ()
 queue job = void $ lpush ("queue:" <> jobQueue job) [LBS.toStrict $ encode job]
@@ -122,8 +122,16 @@ startProcessor Config{..} m = repeatUntil (managerStopping m) $ do
   case ejob of
     Right (Just (q, jjob)) -> case dispatch kWorkers jjob of
       Nothing -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
-      Just (worker, job) -> runMiddleware (kMiddleware ++ [doWork]) m worker job q
+      Just (worker, job) ->
+        runMiddleware
+          (kMiddleware) m worker (asJSON job) q
+          (workerPerform worker $ jobArgs job)
     _ -> $(logDebug) "Nothing to do here"
+
+asJSON :: ToJSON a => a -> Object
+asJSON a = case toJSON a of
+  Object o -> o
+  _ -> error "FIXME: define Job -> Object mapping directly"
 
 repeatUntil :: Monad m => m Bool -> m () -> m ()
 repeatUntil check act = do
@@ -141,10 +149,6 @@ dispatch workers payload = do
 rightToMaybe :: Either a b -> Maybe b
 rightToMaybe (Right b) = Just b
 rightToMaybe _ = Nothing
-
-doWork :: (MonadBaseControl IO m, MonadIO m, ToJSON a)
-       => Manager -> Worker m a -> Job a -> Queue -> m () -> m ()
-doWork Manager{..} worker job q _ = workerPerform worker $ jobArgs job
 
 redisTimeout :: Integer
 redisTimeout = 30
@@ -187,8 +191,9 @@ startPolling m@Manager{..} = forkWatch m "poller" . forever $ do
 requeueFrom :: Queue -> BS.ByteString -> Redis ()
 requeueFrom q payload = case decode $ LBS.fromStrict payload of
   Just job -> do
-    zrem q [payload]
     queue (job :: Job Value)
+    zrem q [payload]
+    return ()
   _ -> return ()
 
 

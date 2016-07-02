@@ -42,6 +42,7 @@ library
                      , transformers
                      , transformers-base
                      , unix
+                     , unordered-containers
                      , vector-space
   default-language:    Haskell2010
   default-extensions:  LambdaCase
