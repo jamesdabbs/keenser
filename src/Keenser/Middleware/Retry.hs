@@ -19,12 +19,16 @@ import qualified Data.Text as T
 retry :: (MonadLogger m, MonadBaseControl IO m, MonadIO m) => Middleware m
 retry Manager{..} _ job q inner = catch inner $ \e -> do
   (count, ts, rJob) <- nextRetry e job q
-  if count < 25
+  void . liftIO $ if count < 10
     then
-      void . liftIO. runRedis managerRedis $
+      runRedis managerRedis $
         zadd "retry" [(timeToDouble ts, LBS.toStrict $ encode rJob)]
     else do
-      $(logError) "TODO: send job to dead queue"
+      now <- getCurrentTime
+      runRedis managerRedis $ do
+         zadd "dead" [(timeToDouble now, LBS.toStrict $ encode job)]
+         -- TODO: prune by count and time, customizable
+         zremrangebyrank "dead" 0 (-1000)
 
 -- TODO: + rand(30) * (count + 1) to prevent thundering herd
 retryTime :: Integer -> UTCTime -> UTCTime
@@ -41,19 +45,16 @@ nextRetry ex old q = do
     --   but if we're staying consistent w/ Sidekiq's Redis API, we need to allow
     --   middleware authors to jam whatever metadata they want on the Jobject
     (count, status) = case HM.lookup "retry_count" old >>= mJSON of
-      Just n  -> (n+1, ["retried_at" .= timestamp now])
-      Nothing -> (  0, ["failed_at"  .= timestamp now])
+      Just n  -> (n+1, ["retried_at" .= timeToJson now])
+      Nothing -> (  0, ["failed_at"  .= timeToJson now])
     updates = HM.fromList $
       [ "queue"         .= fromMaybe q (HM.lookup "retry_queue" old >>= mJSON)
-      , "error_message" .= todo
-      , "error_class"   .= todo
+      , "error_message" .= show ex
+      , "error_class"   .= ("SomeException" :: T.Text)
       , "retry_count"   .= count
       ] ++ status
   $(logInfo) $ "Retry number " <> T.pack (show count)
   return $! (count, retryTime count now, HM.union updates old)
-
-todo :: T.Text
-todo = "TODO"
 
 mJSON :: FromJSON a => Value -> Maybe a
 mJSON v = case fromJSON v of

@@ -78,17 +78,18 @@ main = do
   m <- startProcess conf
 
   -- enqueueIn 60 m count 3
-  enqueue m nope 42
+  -- enqueue m nope 42
 
-  -- replicateM_ crashes $ enqueue m crash ()
-  -- forM_ [1 .. counts] $ enqueue m count
+  replicateM_ crashes $ enqueue m crash ()
+  forM_ [1 .. counts] $ enqueue m count
 
-  forkIO . forever $ do
-    t <- getLine
-    if t == "q"
-      then do
-        putStrLn "Stopping"
-        halt m
-      else putStrLn "Press `q` to quit"
+  forkIO . forever $
+    getLine >>= handleCmd m
 
   await m
+
+handleCmd :: Manager -> String -> IO ()
+handleCmd m t
+  | t == "q"  = putStrLn "Stopping" >> halt m
+  | t == ""   = return ()
+  | otherwise = putStrLn "Press `q` to quit"

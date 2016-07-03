@@ -54,6 +54,13 @@ import Keenser.Middleware
 import Keenser.Types
 import Keenser.Util
 
+
+redisTimeout :: Integer
+redisTimeout = 30
+
+heartBeatFreq :: Int
+heartBeatFreq = 5
+
 -- TODO: check for and handle Redis errors throughout
 
 mkConf :: Monad m => Connection -> Configurator m -> m (Config m)
@@ -106,22 +113,25 @@ startProcessor Config{..} m = repeatUntil (managerStopping m) $ do
   ejob <- liftIO . runRedis kRedis $ brpop mqs redisTimeout
   case ejob of
     Right (Just (q, jjob)) -> case dispatch kWorkers jjob of
-      Nothing -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
-      Just (worker, job) ->
+      Just (worker, Object obj, job) ->
         runMiddleware
-          (kMiddleware) m worker (asJSON job) q
+          kMiddleware m worker obj q
           (workerPerform worker $ jobArgs job)
+      _ -> $(logError) $ "could not find worker for " <> decodeUtf8 jjob
     _ -> $(logDebug) "Nothing to do here"
 
 
-dispatch :: M.Map WorkerName (Worker m Value) -> BS.ByteString -> Maybe (Worker m Value, Job Value)
+dispatch :: M.Map WorkerName (Worker m Value) -> BS.ByteString -> Maybe (Worker m Value, Value, Job Value)
 dispatch workers payload = do
-  jv     <- decode $ LBS.fromStrict payload
-  worker <- M.lookup (jobClass jv) workers
-  return $! (worker, jv)
+  jobj   <- parseMaybe json payload
+  job    <- getJob jobj
+  worker <- M.lookup (jobClass job) workers
+  return $! (worker, jobj, job)
 
-redisTimeout :: Integer
-redisTimeout = 30
+getJob :: Value -> Maybe (Job Value)
+getJob v = case fromJSON v of
+  Success j -> Just j
+  _         -> Nothing
 
 listenForSignals :: (MonadLogger m, MonadBaseControl IO m, MonadIO m) => Manager -> m ()
 listenForSignals m@Manager{..} = void . fork . forever $ do
@@ -161,7 +171,8 @@ startPolling m@Manager{..} = forkWatch m "poller" . forever $ do
 requeueFrom :: Queue -> BS.ByteString -> Redis ()
 requeueFrom q payload = case decode $ LBS.fromStrict payload of
   Just job -> do
-    queue (job :: Job Value)
+    let q2 = jobQueue (job :: Job Value)
+    lpush q2 [payload]
     zrem q [payload]
     return ()
   _ -> return ()
@@ -226,7 +237,7 @@ heartBeat m@Manager{..} = liftIO $ do
       incrby "stat:failed" fails
       incrby ("stat:failed:" <> daystamp now) dones
       expire managerIdentity 60
-    sleep 5
+    sleep heartBeatFreq
 
 forkWatch :: (MonadLogger m, MonadBaseControl IO m, MonadIO m) => Manager -> T.Text -> m () -> m ()
 forkWatch m name a = do
