@@ -15,6 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
+  ghc-options:         -Wall
   exposed-modules:     Keenser
                      , Keenser.Middleware
                      , Keenser.Middleware.Retry
@@ -33,10 +34,7 @@ library
                      , lifted-base
                      , monad-control
                      , monad-logger
-                     -- TODO: this should be Crytpo.Random or something
-                     , random-extras
-                     , random-fu
-                     , random-source
+                     , random
                      , scientific
                      , stm
                      , text

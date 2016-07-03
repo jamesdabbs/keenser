@@ -21,27 +21,18 @@ module Keenser
   ) where
 
 import           Control.Concurrent          (ThreadId)
-import           Control.Concurrent.Lifted   (fork, forkFinally, killThread, myThreadId, threadDelay)
+import           Control.Concurrent.Lifted   (fork, forkFinally, killThread, threadDelay)
 import           Control.Concurrent.STM      (atomically)
-import           Control.Concurrent.STM.TVar (TVar, newTVarIO, modifyTVar', swapTVar, readTVarIO, writeTVar)
-import           Control.Exception.Lifted    (SomeException, catch)
+import           Control.Concurrent.STM.TVar (newTVarIO, swapTVar, readTVarIO, writeTVar)
 import           Control.Monad.Logger
-import           Control.Monad.IO.Class      (MonadIO, liftIO)
-import           Control.Monad.Trans.Control (MonadBaseControl)
-import           Control.Monad.Trans.Reader  (ReaderT, ask, runReaderT)
 import           Control.Monad.Trans.State
 import           Data.Aeson
 import qualified Data.ByteString             as BS
 import qualified Data.ByteString.Char8       as BSC
 import qualified Data.ByteString.Lazy        as LBS
-import           Data.Int                    (Int32)
-import           Data.List                   as L
 import qualified Data.Map                    as M
-import qualified Data.Set                    as S
-import qualified Data.Scientific             as SC
 import qualified Data.Text                   as T
-import           Data.Text.Encoding          (decodeUtf8, encodeUtf8)
-import           Data.Time.Format            (defaultTimeLocale, formatTime, parseTimeOrError)
+import           Data.Text.Encoding          (decodeUtf8)
 import           Database.Redis              hiding (decode)
 import           Network.HostName            (getHostName)
 import           System.Posix.Process        (getProcessID)
@@ -81,10 +72,10 @@ concurrency n = modify $ \c -> c { kConcurrency = n }
 register :: (MonadLogger m, MonadIO m, FromJSON a) => Worker m a -> Configurator m
 register Worker{..} = modify $ \c -> c { kWorkers = M.insert workerName w $ kWorkers c }
   where
-    w = Worker workerName workerQueue $ \object ->
-      case fromJSON object of
+    w = Worker workerName workerQueue $ \obj ->
+      case fromJSON obj of
         Data.Aeson.Success job -> workerPerform job
-        Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show object) <> " / " <> T.pack err
+        Data.Aeson.Error   err -> $(logError) $ "job failed to parse: " <> T.pack (show obj) <> " / " <> T.pack err
 
 
 enqueue :: (ToJSON a, MonadIO m) => Manager -> Worker m a -> a -> m ()
@@ -196,8 +187,8 @@ mkManager Config{..} = liftIO $ do
 startBeat :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ThreadId
 startBeat m@Manager{..} = forkFinally (heartBeat m) $ \e -> do
   case e of
-    Left err -> $(logError) $ "Heartbeat error " <> T.pack (show e)
-    _        -> $(logDebug) $ "Stopping heartbeat"
+    Left _ -> $(logError) $ "Heartbeat error " <> T.pack (show e)
+    _      -> $(logDebug) $ "Stopping heartbeat"
 
   liftIO . void . runRedis managerRedis $ do
     srem "processess" [managerIdentity]
@@ -216,10 +207,11 @@ heartBeat m@Manager{..} = liftIO $ do
     sadd "queues" managerQueues
 
   forever $ do
-    now     <- getCurrentTime
-    working <- workload m
-    dones   <- atomically $ swapTVar managerComplete 0
-    fails   <- atomically $ swapTVar managerFailed   0
+    now      <- getCurrentTime
+    working  <- workload m
+    stopping <- readTVarIO managerQuiet
+    dones    <- atomically $ swapTVar managerComplete 0
+    fails    <- atomically $ swapTVar managerFailed   0
 
     -- For what it's worth, an abort between here and the end of the block could cause us to under-report stats
     runRedis managerRedis $ do
@@ -228,7 +220,7 @@ heartBeat m@Manager{..} = liftIO $ do
         [ ("beat",  timestamp now)
         , ("info",  LBS.toStrict $ encode m)
         , ("busy",  BSC.pack . show $ length working)
-        , ("quiet", "false") -- TODO should be true iff the worker has stopped taking jobs
+        , ("quiet", boolToRedis stopping)
         ]
       _ <- del [managerIdentity <> ":workers"]
       hmset (managerIdentity <> ":workers") $ map workToRedis working

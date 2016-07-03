@@ -9,7 +9,6 @@ import Control.Monad
 import Control.Monad.Logger
 import Data.Aeson
 import qualified Data.ByteString as BS
-import Data.Maybe
 import Data.Monoid
 import qualified Data.Text as T
 import Database.Redis
@@ -44,16 +43,16 @@ nope = Worker "nope" "default" $ \n -> do
   error $ "NOPE " ++ show n
 
 notify :: T.Text -> Middleware IO
-notify str m w j q run = do
+notify str _ _ j q run = do
   $(logDebug) $ str <> " - starting job " <> s q <> " " <> s (encode j)
   run
   $(logDebug) $ str <> " - done"
 
 noop :: Middleware IO
-noop m w j q run = run
+noop _ _ _ _ run = run
 
 defaults :: [a] -> [a] -> [a]
-defaults (a:as) (b:bs) = b : defaults as bs
+defaults (_:as) (b:bs) = b : defaults as bs
 defaults as [] = as
 defaults _ _ = []
 

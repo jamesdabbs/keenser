@@ -5,10 +5,8 @@ module Keenser.Middleware.Stats
 
 import           Control.Concurrent.Lifted   (myThreadId)
 import           Control.Concurrent.STM      (atomically)
-import           Control.Concurrent.STM.TVar (newTVarIO, modifyTVar', swapTVar, readTVarIO, writeTVar)
+import           Control.Concurrent.STM.TVar (modifyTVar')
 import           Control.Exception.Lifted    (SomeException, catch, throwIO)
-import           Control.Monad.Logger
-import           Data.Aeson
 import qualified Data.Map                    as M
 
 import Keenser.Import

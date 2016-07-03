@@ -7,17 +7,7 @@ module Keenser.Middleware
   , runMiddleware
   ) where
 
-import           Control.Concurrent.Lifted   (fork, forkFinally, killThread, myThreadId, threadDelay)
-import           Control.Concurrent.STM      (atomically)
-import           Control.Concurrent.STM.TVar (newTVarIO, modifyTVar', swapTVar, readTVarIO, writeTVar)
-import           Control.Exception.Lifted    (SomeException, catch, throwIO)
-import           Control.Monad.Logger
-import           Data.Aeson
-import qualified Data.ByteString.Lazy        as LBS
-import qualified Data.HashMap.Strict         as HM
-import qualified Data.Map                    as M
-import qualified Data.Text                   as T
-import           Database.Redis
+import Data.Aeson
 
 import Keenser.Types
 import Keenser.Import
