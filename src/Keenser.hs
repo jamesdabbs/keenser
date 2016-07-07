@@ -193,12 +193,10 @@ mkManager Config{..} = liftIO $ do
 
 clearRedis :: Manager -> Bool -> IO ()
 clearRedis Manager{..} raise = do
-  liftIO . void . runRedis managerRedis $ do
-    srem "processess" [managerIdentity]
+  _ <- liftIO . void . runRedis managerRedis $ do
+    srem "processes" [managerIdentity]
     del [managerIdentity]
-  when raise $ do
-    putStrLn "Waiting 2 seconds for workers to exit"
-    sleep 2
+  when raise $
     raiseSignal keyboardSignal
 
 startBeat :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ThreadId
@@ -221,6 +219,7 @@ heartBeat :: MonadIO m => Manager -> m ()
 heartBeat m@Manager{..} = liftIO $ do
   runRedis managerRedis $ do
     _ <- del ["queues"]
+    sadd "processes" [managerIdentity]
     sadd "queues" managerQueues
 
   forever $ do
@@ -232,7 +231,6 @@ heartBeat m@Manager{..} = liftIO $ do
 
     -- For what it's worth, an abort between here and the end of the block could cause us to under-report stats
     runRedis managerRedis $ do
-      sadd "processes" [managerIdentity]
       hmset managerIdentity
         [ ("beat",  timestamp now)
         , ("info",  LBS.toStrict $ encode m)
@@ -254,7 +252,8 @@ checkStatus Manager{..} conn = liftIO . runRedis conn $ do
   info   <- hgetall managerIdentity
   done   <- Database.Redis.get "stat:processed"
   failed <- Database.Redis.get "stat:failed"
-  return $! ManagerStatus (d procs []) (d info []) (d' done 0) (d' failed 0)
+  qs     <- mapM getQueueLength managerQueues
+  return $! ManagerStatus (d procs []) (d info []) (d' done 0) (d' failed 0) qs
 
 -- TODO: clean this up
 d :: Either Reply a -> a -> a
@@ -264,6 +263,11 @@ d _ a = a
 d' :: Read a => Either Reply (Maybe BSC.ByteString) -> a -> a
 d' (Right (Just a)) _ = read $ BSC.unpack a
 d' _ a = a
+
+getQueueLength :: BS.ByteString -> Redis (BS.ByteString, Integer)
+getQueueLength q = do
+  len <- llen $ "queue:" <> q
+  return $! (q, d len 0)
 
 forkWatch :: (MonadLogger m, MonadBaseControl IO m, MonadIO m) => Manager -> T.Text -> m () -> m ()
 forkWatch m name a = do

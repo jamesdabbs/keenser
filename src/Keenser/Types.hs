@@ -68,6 +68,7 @@ data ManagerStatus = ManagerStatus
   , sState  :: [(BS.ByteString, BS.ByteString)]
   , sDone   :: Int
   , sFailed :: Int
+  , sQueues :: [(BS.ByteString, Integer)]
   } deriving Show
 
 type Middleware m = Manager -> Worker m Value -> Object -> Queue -> m () -> m ()
