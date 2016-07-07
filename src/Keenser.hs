@@ -2,10 +2,14 @@
 {-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE TemplateHaskell      #-}
 module Keenser
-  ( Manager
+  ( Config
+  , Configurator
+  , Manager
+  , ManagerStatus(..)
   , Middleware
   , Worker(..)
   , await
+  , checkStatus
   , concurrency
   , halt
   , enqueue
@@ -36,6 +40,7 @@ import           Data.Text.Encoding          (decodeUtf8)
 import           Database.Redis              hiding (decode)
 import           Network.HostName            (getHostName)
 import           System.Posix.Process        (getProcessID)
+import           System.Posix.Signals
 import           System.Posix.Types          (CPid(..))
 
 import Debug.Trace
@@ -97,6 +102,7 @@ enqueueIn snds m w args = do
 -- TODO:
 -- - handle the various failure modes here (timeout, can't match worker, can't get work)
 -- - if doWork crashes, we should requeue the job, kill this thread, and restart a new processor
+-- - track down the intermittent "<socket: #>: hFlush: illegal operation (handle is closed)" error from here
 startProcessor :: (MonadBaseControl IO m, MonadIO m, MonadLogger m)
                => Config m -> Manager -> m ()
 startProcessor Config{..} m = repeatUntil (managerStopping m) $ do
@@ -144,8 +150,9 @@ startProcess c@Config{..} = do
   listenForSignals m
   startPolling m
 
-  -- Start up concurrency many processor threads
-  replicateM_ kConcurrency . forkWatch m "processor" $ startProcessor c m
+  forM_ [1 .. kConcurrency] $ \n ->
+    let name = "processor " <> T.pack (show n)
+    in forkWatch m name $ startProcessor c m
   return $! m
 
 startPolling :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ()
@@ -184,15 +191,25 @@ mkManager Config{..} = liftIO $ do
     <*> newTVarIO 0
     <*> newTVarIO False
 
-startBeat :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ThreadId
-startBeat m@Manager{..} = forkFinally (heartBeat m) $ \e -> do
-  case e of
-    Left _ -> $(logError) $ "Heartbeat error " <> T.pack (show e)
-    _      -> $(logDebug) $ "Stopping heartbeat"
-
+clearRedis :: Manager -> Bool -> IO ()
+clearRedis Manager{..} raise = do
   liftIO . void . runRedis managerRedis $ do
     srem "processess" [managerIdentity]
     del [managerIdentity]
+  when raise $ do
+    putStrLn "Waiting 2 seconds for workers to exit"
+    sleep 2
+    raiseSignal keyboardSignal
+
+startBeat :: (MonadBaseControl IO m, MonadLogger m, MonadIO m) => Manager -> m ThreadId
+startBeat m@Manager{..} = do
+  liftIO $ installHandler keyboardSignal (CatchOnce $ clearRedis m True) Nothing
+
+  forkFinally (heartBeat m) $ \e -> do
+    case e of
+      Left _ -> $(logError) $ "Heartbeat error " <> T.pack (show e)
+      _      -> $(logDebug) $ "Stopping heartbeat"
+    liftIO $ clearRedis m False
 
 workload :: MonadIO m => Manager -> m [RunningJob]
 workload Manager{..} = liftIO $ M.elems <$> readTVarIO managerRunning
@@ -231,12 +248,32 @@ heartBeat m@Manager{..} = liftIO $ do
       expire managerIdentity 60
     sleep heartBeatFreq
 
+checkStatus :: MonadIO m => Manager -> Connection -> m ManagerStatus
+checkStatus Manager{..} conn = liftIO . runRedis conn $ do
+  procs  <- smembers "processes"
+  info   <- hgetall managerIdentity
+  done   <- Database.Redis.get "stat:processed"
+  failed <- Database.Redis.get "stat:failed"
+  return $! ManagerStatus (d procs []) (d info []) (d' done 0) (d' failed 0)
+
+-- TODO: clean this up
+d :: Either Reply a -> a -> a
+d (Right a) _ = a
+d _ a = a
+
+d' :: Read a => Either Reply (Maybe BSC.ByteString) -> a -> a
+d' (Right (Just a)) _ = read $ BSC.unpack a
+d' _ a = a
+
 forkWatch :: (MonadLogger m, MonadBaseControl IO m, MonadIO m) => Manager -> T.Text -> m () -> m ()
 forkWatch m name a = do
-  $(logInfo) $ "starting " <> name
-  void $ forkFinally a cleanup
+  $(logInfo) $ name <> " starting."
+  void $ forkFinally a restart
   where
-    cleanup _ = $(logDebug) $ name <> " exited"
+    restart (Left e) = do
+      $(logError) $ name <> " exited " <> T.pack (show e) <> ". Restarting."
+      forkWatch m name a
+    restart (Right _) = $(logDebug) $ name <> " exited clean."
 
 await :: Manager -> IO ()
 await m = do

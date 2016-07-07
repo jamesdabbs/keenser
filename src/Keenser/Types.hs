@@ -5,6 +5,7 @@ module Keenser.Types
   , Job(..)
   , JobId
   , Manager(..)
+  , ManagerStatus(..)
   , Middleware
   , Queue
   , RunningJob(..)
@@ -61,6 +62,13 @@ data Manager = Manager
   , managerFailed      :: TVar Integer
   , managerQuiet       :: TVar Bool
   }
+
+data ManagerStatus = ManagerStatus
+  { sProcs  :: [BS.ByteString]
+  , sState  :: [(BS.ByteString, BS.ByteString)]
+  , sDone   :: Int
+  , sFailed :: Int
+  } deriving Show
 
 type Middleware m = Manager -> Worker m Value -> Object -> Queue -> m () -> m ()
 

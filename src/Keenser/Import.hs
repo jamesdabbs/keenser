@@ -11,6 +11,8 @@ import Data.Maybe                  as Keenser.Import (fromMaybe)
 import Data.Monoid                 as Keenser.Import ((<>))
 import Data.Thyme.Clock            as Keenser.Import (UTCTime, getCurrentTime)
 
+import Prelude as Keenser.Import
+
 import           Data.AffineSpace            ((.+^))
 import qualified Data.ByteString             as BS
 import qualified Data.ByteString.Char8       as BSC
