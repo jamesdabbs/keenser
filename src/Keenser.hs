@@ -22,6 +22,7 @@ module Keenser
   , retry
   , sleep
   , startProcess
+  , mkManager
   ) where
 
 import           Control.Concurrent          (ThreadId)
